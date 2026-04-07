@@ -113,6 +113,11 @@ logger.error("Unhandled server error", {
   stack: env.isDevelopment ? err.stack : undefined
 });
 
+app.get("/", (req, res) => {
+  res.send("Backend is running ");
+});
+
+
   if (err.message === "Not allowed by CORS") {
     return res.status(403).json({
       success: false,
