@@ -20,8 +20,11 @@ const env = {
   jwtSecret: getRequiredEnv("JWT_SECRET"),
   jwtExpiresIn: getEnv("JWT_EXPIRES_IN", "7d"),
 
-  frontendUrl: getEnv("FRONTEND_URL", "http://localhost:5500"),
-  adminUrl: getEnv("ADMIN_URL", "http://localhost:5500"),
+  // frontendUrl: getEnv("FRONTEND_URL", "http://localhost:5500"),
+  // adminUrl: getEnv("ADMIN_URL", "http://localhost:5500"),
+
+   frontendUrl: getEnv("FRONTEND_URL", "https://my-projectfrontend-bark.vercel.app/"),
+  adminUrl: getEnv("ADMIN_URL", "https://my-projectfrontend-bark.vercel.app/"),
 
   isProduction: getEnv("NODE_ENV", "development") === "production",
   isDevelopment: getEnv("NODE_ENV", "development") === "development"
