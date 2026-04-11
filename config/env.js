@@ -20,8 +20,8 @@ const env = {
   jwtSecret: getRequiredEnv("JWT_SECRET"),
   jwtExpiresIn: getEnv("JWT_EXPIRES_IN", "7d"),
 
-  frontendUrl: getEnv("FRONTEND_URL", "https://my-projectfrontend.funzone0808.workers.dev/"),
-  adminUrl: getEnv("ADMIN_URL", "https://my-projectfrontend.funzone0808.workers.dev/"),
+  frontendUrl: getEnv("FRONTEND_URL", "https://my-projectfrontend.funzone0808.workers.dev"),
+  adminUrl: getEnv("ADMIN_URL", "https://my-projectfrontend.funzone0808.workers.dev"),
   notificationDeliveryEnabled:
     getEnv("NOTIFICATION_DELIVERY_ENABLED", "false") === "true",
   notificationDeliveryChannel: getEnv("NOTIFICATION_DELIVERY_CHANNEL", "internal"),

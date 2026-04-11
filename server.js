@@ -50,7 +50,6 @@ const authLimiter = rateLimit({
 //   "http://localhost:5500",
 //   "http://127.0.0.1:5500"
 // ];
-const allowedOrigins = [env.frontendUrl, env.adminUrl];
 
  app.use(limiter);
 
@@ -62,14 +61,27 @@ app.use(express.urlencoded({ extended: true, limit: "1mb" }));
 // app.set("trust proxy", 1); // enable in production behind trusted proxy
 
 
+const normalizeOrigin = (value = "") => value.replace(/\/$/, "");
+
+const allowedOrigins = [env.frontendUrl, env.adminUrl]
+  .filter(Boolean)
+  .map(normalizeOrigin);
+
 app.use(
   cors({
     origin(origin, callback) {
       if (!origin) return callback(null, true);
 
-      if (allowedOrigins.includes(origin)) {
+      const normalizedOrigin = normalizeOrigin(origin);
+
+      if (allowedOrigins.includes(normalizedOrigin)) {
         return callback(null, true);
       }
+
+      logger.warn("Blocked by CORS", {
+        origin: normalizedOrigin,
+        allowedOrigins
+      });
 
       return callback(new Error("Not allowed by CORS"));
     },
