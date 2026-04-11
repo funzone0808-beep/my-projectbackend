@@ -11,8 +11,8 @@ function getRequiredEnv(name) {
 }
 
 const env = {
-  nodeEnv: getEnv("NODE_ENV", "development"),
-  port: Number(getEnv("PORT", "5000")),
+  nodeEnv: getEnv("NODE_ENV", "production"),
+  port: Number(getEnv("PORT", "10000")),
 
   supabaseUrl: getRequiredEnv("SUPABASE_URL"),
   supabaseServiceRoleKey: getRequiredEnv("SUPABASE_SERVICE_ROLE_KEY"),
@@ -20,11 +20,19 @@ const env = {
   jwtSecret: getRequiredEnv("JWT_SECRET"),
   jwtExpiresIn: getEnv("JWT_EXPIRES_IN", "7d"),
 
-  // frontendUrl: getEnv("FRONTEND_URL", "http://localhost:5500"),
-  // adminUrl: getEnv("ADMIN_URL", "http://localhost:5500"),
-
-   frontendUrl: getEnv("FRONTEND_URL", "https://my-projectfrontend-bark.vercel.app/"),
-  adminUrl: getEnv("ADMIN_URL", "https://my-projectfrontend-bark.vercel.app/"),
+  frontendUrl: getEnv("FRONTEND_URL", ""),
+  adminUrl: getEnv("ADMIN_URL", ""),
+  notificationDeliveryEnabled:
+    getEnv("NOTIFICATION_DELIVERY_ENABLED", "false") === "true",
+  notificationDeliveryChannel: getEnv("NOTIFICATION_DELIVERY_CHANNEL", "internal"),
+  notificationEmailFrom: getEnv("NOTIFICATION_EMAIL_FROM", ""),
+  notificationEmailTo: getEnv("NOTIFICATION_EMAIL_TO", ""),
+  notificationSmtpHost: getEnv("NOTIFICATION_SMTP_HOST", ""),
+  notificationSmtpPort: Number(getEnv("NOTIFICATION_SMTP_PORT", "587")),
+  notificationSmtpSecure:
+    getEnv("NOTIFICATION_SMTP_SECURE", "false") === "true",
+  notificationSmtpUser: getEnv("NOTIFICATION_SMTP_USER", ""),
+  notificationSmtpPass: getEnv("NOTIFICATION_SMTP_PASS", ""),
 
   isProduction: getEnv("NODE_ENV", "development") === "production",
   isDevelopment: getEnv("NODE_ENV", "development") === "development"

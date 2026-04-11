@@ -1,5 +1,6 @@
 const express = require("express");
 const { supabase } = require("../utils/supabase");
+const { createNotificationEventSafely } = require("../utils/notifications");
 
 // ✅ Added imports
 const { validateBody } = require("../validators/common");
@@ -45,6 +46,23 @@ router.post("/", validateBody(reservationSchema), async (req, res) => {
     if (error) {
       throw error;
     }
+
+    void createNotificationEventSafely({
+      hotelSlug: data.hotel_slug || hotelSlug || null,
+      sourceType: "reservation",
+      sourceId: data.id,
+      payload: {
+        reservationId: data.id,
+        hotelName: data.hotel_name || hotelName || "",
+        name: data.name || name,
+        phone: data.phone || phone,
+        date: data.date || date,
+        time: data.time || time,
+        guests: data.guests || guests,
+        note: data.note || note || "",
+        status: data.status || "new"
+      }
+    });
 
     res.status(201).json({
       success: true,

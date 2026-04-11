@@ -3,6 +3,22 @@ const { supabase } = require("../utils/supabase");
 
 const router = express.Router();
 
+function isMissingTestimonialsRelationError(error) {
+  const code = String(error?.code || "").trim().toUpperCase();
+  const details = `${error?.message || ""} ${error?.details || ""} ${error?.hint || ""}`
+    .trim()
+    .toLowerCase();
+
+  return (
+    code === "42P01" ||
+    code === "PGRST205" ||
+    (details.includes("testimonial") &&
+      (details.includes("relation") ||
+        details.includes("schema cache") ||
+        details.includes("could not find")))
+  );
+}
+
 router.get("/hotel/:slug", async (req, res) => {
   try {
     const { slug } = req.params;
@@ -80,6 +96,106 @@ router.get("/menu/:slug", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to fetch menu"
+    });
+  }
+});
+
+router.get("/gallery/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+
+    const { data, error } = await supabase
+      .from("gallery_items")
+      .select("*")
+      .eq("hotel_slug", slug)
+      .eq("is_active", true)
+      .eq("is_archived", false)
+      .order("sort_order", { ascending: true })
+      .order("id", { ascending: true });
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      gallery: (data || []).map((item) => ({
+        id: item.id,
+        imageUrl: item.image_url || "",
+        storagePath: item.storage_path || "",
+        alt: item.alt || "",
+        layoutVariant: item.layout_variant || "standard",
+        sortOrder: Number(item.sort_order || 0)
+      }))
+    });
+  } catch (error) {
+    console.error("Public gallery fetch error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch gallery"
+    });
+  }
+});
+
+router.get("/testimonials/:slug", async (req, res) => {
+  try {
+    const { slug } = req.params;
+
+    const { data, error } = await supabase
+      .from("testimonials")
+      .select("*")
+      .eq("hotel_slug", slug);
+
+    if (error) {
+      if (isMissingTestimonialsRelationError(error)) {
+        return res.json({
+          success: true,
+          testimonials: []
+        });
+      }
+
+      throw error;
+    }
+
+    const testimonials = (data || [])
+      .filter(
+        (item) =>
+          item &&
+          item.is_archived !== true &&
+          item.is_active !== false &&
+          item.is_approved !== false
+      )
+      .sort((left, right) => {
+        const leftSort = Number.isFinite(Number(left?.sort_order)) ? Number(left.sort_order) : 0;
+        const rightSort = Number.isFinite(Number(right?.sort_order)) ? Number(right.sort_order) : 0;
+
+        if (leftSort !== rightSort) {
+          return leftSort - rightSort;
+        }
+
+        const leftCreated = Date.parse(left?.created_at || "") || 0;
+        const rightCreated = Date.parse(right?.created_at || "") || 0;
+
+        return rightCreated - leftCreated;
+      })
+      .map((item) => ({
+        id: item.id,
+        hotelSlug: item.hotel_slug || slug,
+        name: item.guest_name || item.name || "",
+        role: item.guest_role || item.role || "",
+        text: item.review_text || item.text || "",
+        stars: Number(item.star_rating ?? item.stars ?? 5) || 5,
+        avatar: item.avatar_url || item.avatar || ""
+      }))
+      .filter((item) => item.name && item.text);
+
+    res.json({
+      success: true,
+      testimonials
+    });
+  } catch (error) {
+    console.error("Public testimonials fetch error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch testimonials"
     });
   }
 });

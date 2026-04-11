@@ -7,6 +7,12 @@ const orderItemSchema = z.object({
   price: z.number().nonnegative()
 });
 
+const orderContextSchema = z.object({
+  orderType: z.string().trim().max(40).optional(),
+  tableNumber: z.string().trim().max(80).optional(),
+  orderSource: z.string().trim().max(40).optional()
+}).optional();
+
 const orderSchema = z.object({
   hotelName: z.string().trim().min(1),
   hotelSlug: z.string().trim().min(1).optional().nullable(),
@@ -25,7 +31,8 @@ const orderSchema = z.object({
     gpayDiscount: z.number().nonnegative().optional(),
     gpayFinalTotal: z.number().nonnegative().optional()
   }).optional(),
-  whatsappMessage: z.string().max(5000).optional()
+  whatsappMessage: z.string().max(5000).optional(),
+  orderContext: orderContextSchema
 });
 
 const inquirySchema = z.object({
@@ -50,8 +57,18 @@ const reservationSchema = z.object({
   note: z.string().max(1000).optional()
 });
 
+const testimonialSubmissionSchema = z.object({
+  hotelName: z.string().trim().min(1).max(150),
+  hotelSlug: z.string().trim().min(1).max(120),
+  name: z.string().trim().min(2).max(150),
+  role: z.string().trim().max(150).optional(),
+  text: z.string().trim().min(2).max(4000),
+  stars: z.number().int().min(1).max(5)
+});
+
 module.exports = {
   orderSchema,
   inquirySchema,
-  reservationSchema
+  reservationSchema,
+  testimonialSubmissionSchema
 };

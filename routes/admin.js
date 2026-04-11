@@ -1,13 +1,72 @@
 const express = require("express");
 const { supabase } = require("../utils/supabase");
 const { requireAdminAuth } = require("../middleware/require-admin-auth");
+const {
+  processNotificationEventDeliverySafely
+} = require("../utils/notifications");
 const router = express.Router();
 const { validateBody } = require("../validators/common");
 const {
+  galleryItemSchema,
   hotelSchema,
+  hotelNotificationSettingsSchema,
   menuItemSchema,
-  hotelProfileSchema
+  partialGalleryItemSchema,
+  hotelProfileSchema,
+  testimonialSchema,
+  partialTestimonialSchema
 } = require("../validators/admin");
+
+const NOTIFICATION_EVENT_SOURCE_TYPES = ["order", "reservation", "inquiry"];
+const NOTIFICATION_EVENT_STATUSES = ["pending", "sent", "failed", "skipped"];
+const NOTIFICATION_EVENT_MAX_RETRIES = 3;
+
+function isMissingTestimonialsRelationError(error) {
+  const code = String(error?.code || "").trim().toUpperCase();
+  const details = `${error?.message || ""} ${error?.details || ""} ${error?.hint || ""}`
+    .trim()
+    .toLowerCase();
+
+  return (
+    code === "42P01" ||
+    code === "PGRST205" ||
+    (details.includes("testimonial") &&
+      (details.includes("relation") ||
+        details.includes("schema cache") ||
+        details.includes("could not find")))
+  );
+}
+
+function getNotificationEventsLimit(value) {
+  const parsedValue = Number.parseInt(String(value || "").trim(), 10);
+
+  if (!Number.isFinite(parsedValue) || parsedValue <= 0) {
+    return 100;
+  }
+
+  return Math.min(parsedValue, 200);
+}
+
+function buildNotificationSettingsResponse(settingsRow, hotelSlug = "") {
+  return {
+    hotelSlug: settingsRow?.hotel_slug || String(hotelSlug || "").trim(),
+    emailEnabled: !!settingsRow?.email_enabled,
+    ownerEmail: settingsRow?.owner_email || "",
+    notifyOnNewOrder:
+      settingsRow?.notify_on_new_order !== undefined
+        ? !!settingsRow.notify_on_new_order
+        : true,
+    notifyOnNewReservation:
+      settingsRow?.notify_on_new_reservation !== undefined
+        ? !!settingsRow.notify_on_new_reservation
+        : true,
+    notifyOnNewInquiry:
+      settingsRow?.notify_on_new_inquiry !== undefined
+        ? !!settingsRow.notify_on_new_inquiry
+        : true
+  };
+}
+
 router.use(requireAdminAuth);
 /* ─────────────────────────────────────────────
    GET /api/admin/orders
@@ -110,6 +169,199 @@ router.get("/reservations", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to fetch reservations"
+    });
+  }
+});
+
+router.get("/notification-events", async (req, res) => {
+  try {
+    const { hotelSlug, sourceType, status } = req.query;
+    const limit = getNotificationEventsLimit(req.query.limit);
+
+    let query = supabase
+      .from("notification_events")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(limit);
+
+    if (hotelSlug) {
+      query = query.eq("hotel_slug", String(hotelSlug).trim());
+    }
+
+    if (
+      sourceType &&
+      NOTIFICATION_EVENT_SOURCE_TYPES.includes(
+        String(sourceType).trim().toLowerCase()
+      )
+    ) {
+      query = query.eq("source_type", String(sourceType).trim().toLowerCase());
+    }
+
+    if (
+      status &&
+      NOTIFICATION_EVENT_STATUSES.includes(String(status).trim().toLowerCase())
+    ) {
+      query = query.eq("status", String(status).trim().toLowerCase());
+    }
+
+    const { data, error } = await query;
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      count: data.length,
+      notificationEvents: data,
+      notificationEventMaxRetries: NOTIFICATION_EVENT_MAX_RETRIES
+    });
+  } catch (error) {
+    console.error("Notification events fetch error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch notification events"
+    });
+  }
+});
+
+router.post("/notification-events/:id/resend", async (req, res) => {
+  try {
+    const notificationEventId = String(req.params.id || "").trim();
+
+    if (!notificationEventId) {
+      return res.status(400).json({
+        success: false,
+        message: "Notification event id is required"
+      });
+    }
+
+    const { data: notificationEvent, error } = await supabase
+      .from("notification_events")
+      .select("*")
+      .eq("id", notificationEventId)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (!notificationEvent) {
+      return res.status(404).json({
+        success: false,
+        message: "Notification event not found"
+      });
+    }
+
+    const currentStatus = String(notificationEvent.status || "")
+      .trim()
+      .toLowerCase();
+
+    if (!["failed", "skipped"].includes(currentStatus)) {
+      return res.status(400).json({
+        success: false,
+        message: "Only failed or skipped notification events can be resent"
+      });
+    }
+
+    const currentRetryCount = Number.parseInt(
+      String(notificationEvent.retry_count ?? "0"),
+      10
+    );
+    const safeRetryCount =
+      Number.isFinite(currentRetryCount) && currentRetryCount >= 0
+        ? currentRetryCount
+        : 0;
+
+    if (safeRetryCount >= NOTIFICATION_EVENT_MAX_RETRIES) {
+      return res.status(400).json({
+        success: false,
+        message: `Maximum resend attempts reached (${NOTIFICATION_EVENT_MAX_RETRIES})`
+      });
+    }
+
+    const nextRetryCount = safeRetryCount + 1;
+    const lastRetryAt = new Date().toISOString();
+
+    const { error: prepareRetryError } = await supabase
+      .from("notification_events")
+      .update({
+        status: "pending",
+        error_message: null,
+        processed_at: null,
+        retry_count: nextRetryCount,
+        last_retry_at: lastRetryAt,
+        updated_at: lastRetryAt
+      })
+      .eq("id", notificationEventId);
+
+    if (prepareRetryError) throw prepareRetryError;
+
+    const processedEvent = await processNotificationEventDeliverySafely({
+      ...notificationEvent,
+      status: "pending",
+      error_message: null,
+      processed_at: null,
+      retry_count: nextRetryCount,
+      last_retry_at: lastRetryAt
+    });
+
+    if (processedEvent) {
+      return res.json({
+        success: true,
+        message: `Notification resend processed (attempt ${nextRetryCount}/${NOTIFICATION_EVENT_MAX_RETRIES})`,
+        notificationEventMaxRetries: NOTIFICATION_EVENT_MAX_RETRIES,
+        notificationEvent: processedEvent
+      });
+    }
+
+    const { data: latestNotificationEvent, error: latestError } = await supabase
+      .from("notification_events")
+      .select("*")
+      .eq("id", notificationEventId)
+      .maybeSingle();
+
+    if (latestError) throw latestError;
+
+    return res.json({
+      success: true,
+      message: `Notification resend attempted (attempt ${nextRetryCount}/${NOTIFICATION_EVENT_MAX_RETRIES})`,
+      notificationEventMaxRetries: NOTIFICATION_EVENT_MAX_RETRIES,
+      notificationEvent: latestNotificationEvent || null
+    });
+  } catch (error) {
+    console.error("Notification resend error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to resend notification event"
+    });
+  }
+});
+
+router.get("/notification-settings/:slug", async (req, res) => {
+  try {
+    const slug = String(req.params.slug || "").trim();
+
+    if (!slug) {
+      return res.status(400).json({
+        success: false,
+        message: "Hotel slug is required"
+      });
+    }
+
+    const { data, error } = await supabase
+      .from("hotel_notification_settings")
+      .select("*")
+      .eq("hotel_slug", slug)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      settings: buildNotificationSettingsResponse(data, slug)
+    });
+  } catch (error) {
+    console.error("Notification settings fetch error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch notification settings"
     });
   }
 });
@@ -391,6 +643,7 @@ router.post("/hotel-profiles", validateBody(hotelProfileSchema), async (req, res
       gstPercent,
       contact,
       branding,
+      theme,
       hero,
       about,
       features,
@@ -415,6 +668,7 @@ router.post("/hotel-profiles", validateBody(hotelProfileSchema), async (req, res
             gst_percent: gstPercent ?? 5,
             contact: contact || {},
             branding: branding || {},
+            theme: theme || {},
             hero: hero || {},
             about: about || {},
             features: features || [],
@@ -447,6 +701,61 @@ router.post("/hotel-profiles", validateBody(hotelProfileSchema), async (req, res
     });
   }
 });
+
+router.post(
+  "/notification-settings",
+  validateBody(hotelNotificationSettingsSchema),
+  async (req, res) => {
+    try {
+      const {
+        hotelSlug,
+        emailEnabled,
+        ownerEmail,
+        notifyOnNewOrder,
+        notifyOnNewReservation,
+        notifyOnNewInquiry
+      } = req.validatedBody;
+
+      const { data, error } = await supabase
+        .from("hotel_notification_settings")
+        .upsert(
+          [
+            {
+              hotel_slug: hotelSlug,
+              email_enabled: emailEnabled !== undefined ? !!emailEnabled : false,
+              owner_email: ownerEmail ? String(ownerEmail).trim() : null,
+              notify_on_new_order:
+                notifyOnNewOrder !== undefined ? !!notifyOnNewOrder : true,
+              notify_on_new_reservation:
+                notifyOnNewReservation !== undefined
+                  ? !!notifyOnNewReservation
+                  : true,
+              notify_on_new_inquiry:
+                notifyOnNewInquiry !== undefined ? !!notifyOnNewInquiry : true,
+              updated_at: new Date().toISOString()
+            }
+          ],
+          { onConflict: "hotel_slug" }
+        )
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      res.json({
+        success: true,
+        message: "Notification settings saved successfully",
+        settings: buildNotificationSettingsResponse(data, hotelSlug)
+      });
+    } catch (error) {
+      console.error("Notification settings save error:", error);
+      res.status(500).json({
+        success: false,
+        message: "Failed to save notification settings"
+      });
+    }
+  }
+);
 
 router.get("/hotel-profiles/:slug", async (req, res) => {
   try {
@@ -512,6 +821,318 @@ router.get("/menu-items", async (req, res) => {
   }
 });
 
+router.get("/gallery-items", async (req, res) => {
+  try {
+    const { hotelSlug } = req.query;
+
+    let query = supabase
+      .from("gallery_items")
+      .select("*")
+      .order("sort_order", { ascending: true })
+      .order("id", { ascending: true });
+
+    if (hotelSlug) {
+      query = query.eq("hotel_slug", hotelSlug);
+    }
+
+    const { data, error } = await query;
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      count: data.length,
+      galleryItems: data
+    });
+  } catch (error) {
+    console.error("Gallery items fetch error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch gallery items"
+    });
+  }
+});
+
+router.get("/testimonials", async (req, res) => {
+  try {
+    const { hotelSlug } = req.query;
+
+    let query = supabase
+      .from("testimonials")
+      .select("*")
+      .order("hotel_slug", { ascending: true })
+      .order("sort_order", { ascending: true })
+      .order("id", { ascending: true });
+
+    if (hotelSlug) {
+      query = query.eq("hotel_slug", String(hotelSlug).trim());
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      if (isMissingTestimonialsRelationError(error)) {
+        return res.json({
+          success: true,
+          count: 0,
+          testimonials: []
+        });
+      }
+
+      throw error;
+    }
+
+    res.json({
+      success: true,
+      count: Array.isArray(data) ? data.length : 0,
+      testimonials: data || []
+    });
+  } catch (error) {
+    console.error("Testimonials fetch error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to fetch testimonials"
+    });
+  }
+});
+
+router.post("/testimonials", validateBody(testimonialSchema), async (req, res) => {
+  try {
+    const {
+      hotelSlug,
+      name,
+      role,
+      text,
+      stars,
+      avatar,
+      sortOrder,
+      isActive,
+      isApproved
+    } = req.validatedBody;
+
+    const { data, error } = await supabase
+      .from("testimonials")
+      .insert([
+        {
+          hotel_slug: hotelSlug,
+          guest_name: name,
+          guest_role: role || "",
+          review_text: text,
+          star_rating: Number(stars || 5),
+          avatar_url: avatar || "",
+          sort_order: Number(sortOrder || 0),
+          is_active: isActive !== undefined ? !!isActive : true,
+          is_approved: isApproved !== undefined ? !!isApproved : true,
+          updated_at: new Date().toISOString()
+        }
+      ])
+      .select()
+      .single();
+
+    if (error) {
+      if (isMissingTestimonialsRelationError(error)) {
+        return res.status(400).json({
+          success: false,
+          message: "Testimonials table is not initialized yet"
+        });
+      }
+
+      throw error;
+    }
+
+    res.status(201).json({
+      success: true,
+      message: "Testimonial created successfully",
+      testimonial: data
+    });
+  } catch (error) {
+    console.error("Testimonial create error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to create testimonial"
+    });
+  }
+});
+
+router.patch("/testimonials/:id", validateBody(partialTestimonialSchema), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      hotelSlug,
+      name,
+      role,
+      text,
+      stars,
+      avatar,
+      sortOrder,
+      isActive,
+      isApproved
+    } = req.validatedBody;
+
+    const updatePayload = {
+      updated_at: new Date().toISOString()
+    };
+
+    if (hotelSlug !== undefined) updatePayload.hotel_slug = hotelSlug;
+    if (name !== undefined) updatePayload.guest_name = name;
+    if (role !== undefined) updatePayload.guest_role = role || "";
+    if (text !== undefined) updatePayload.review_text = text;
+    if (stars !== undefined) updatePayload.star_rating = Number(stars);
+    if (avatar !== undefined) updatePayload.avatar_url = avatar || "";
+    if (sortOrder !== undefined) updatePayload.sort_order = Number(sortOrder);
+    if (isActive !== undefined) updatePayload.is_active = !!isActive;
+    if (isApproved !== undefined) updatePayload.is_approved = !!isApproved;
+
+    if (Object.keys(updatePayload).length === 1) {
+      return res.status(400).json({
+        success: false,
+        message: "At least one field is required to update a testimonial"
+      });
+    }
+
+    const { data, error } = await supabase
+      .from("testimonials")
+      .update(updatePayload)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) {
+      if (isMissingTestimonialsRelationError(error)) {
+        return res.status(400).json({
+          success: false,
+          message: "Testimonials table is not initialized yet"
+        });
+      }
+
+      throw error;
+    }
+
+    res.json({
+      success: true,
+      message: "Testimonial updated successfully",
+      testimonial: data
+    });
+  } catch (error) {
+    console.error("Testimonial update error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update testimonial"
+    });
+  }
+});
+
+router.patch("/testimonials/:id/archive", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { isArchived } = req.body;
+
+    const { data, error } = await supabase
+      .from("testimonials")
+      .update({
+        is_archived: !!isArchived,
+        is_active: !!isArchived ? false : true,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) {
+      if (isMissingTestimonialsRelationError(error)) {
+        return res.status(400).json({
+          success: false,
+          message: "Testimonials table is not initialized yet"
+        });
+      }
+
+      throw error;
+    }
+
+    res.json({
+      success: true,
+      message: !!isArchived ? "Testimonial archived" : "Testimonial restored",
+      testimonial: data
+    });
+  } catch (error) {
+    console.error("Testimonial archive error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to archive testimonial"
+    });
+  }
+});
+
+router.patch("/testimonials/:id/approval", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { isApproved } = req.body;
+
+    const { data, error } = await supabase
+      .from("testimonials")
+      .update({
+        is_approved: !!isApproved,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) {
+      if (isMissingTestimonialsRelationError(error)) {
+        return res.status(400).json({
+          success: false,
+          message: "Testimonials table is not initialized yet"
+        });
+      }
+
+      throw error;
+    }
+
+    res.json({
+      success: true,
+      message: !!isApproved ? "Testimonial approved" : "Testimonial unapproved",
+      testimonial: data
+    });
+  } catch (error) {
+    console.error("Testimonial approval error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update testimonial approval"
+    });
+  }
+});
+
+router.delete("/testimonials/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { error } = await supabase.from("testimonials").delete().eq("id", id);
+
+    if (error) {
+      if (isMissingTestimonialsRelationError(error)) {
+        return res.status(400).json({
+          success: false,
+          message: "Testimonials table is not initialized yet"
+        });
+      }
+
+      throw error;
+    }
+
+    res.json({
+      success: true,
+      message: "Testimonial deleted successfully"
+    });
+  } catch (error) {
+    console.error("Testimonial delete error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to delete testimonial"
+    });
+  }
+});
+
 router.post("/menu-items", validateBody(menuItemSchema), async (req, res) => {
   try {
     const {
@@ -562,6 +1183,50 @@ router.post("/menu-items", validateBody(menuItemSchema), async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to create menu item"
+    });
+  }
+});
+
+router.post("/gallery-items", validateBody(galleryItemSchema), async (req, res) => {
+  try {
+    const {
+      hotelSlug,
+      imageUrl,
+      storagePath,
+      alt,
+      layoutVariant,
+      isActive,
+      sortOrder
+    } = req.validatedBody;
+
+    const { data, error } = await supabase
+      .from("gallery_items")
+      .insert([
+        {
+          hotel_slug: hotelSlug,
+          image_url: imageUrl,
+          storage_path: storagePath || null,
+          alt: alt || "",
+          layout_variant: layoutVariant || "standard",
+          is_active: isActive !== undefined ? !!isActive : true,
+          sort_order: Number(sortOrder || 0)
+        }
+      ])
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.status(201).json({
+      success: true,
+      message: "Gallery item created successfully",
+      galleryItem: data
+    });
+  } catch (error) {
+    console.error("Gallery item create error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to create gallery item"
     });
   }
 });
@@ -620,6 +1285,61 @@ router.patch("/menu-items/:id", async (req, res) => {
   }
 });
 
+router.patch("/gallery-items/:id", validateBody(partialGalleryItemSchema), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      hotelSlug,
+      imageUrl,
+      storagePath,
+      alt,
+      layoutVariant,
+      isActive,
+      sortOrder
+    } = req.validatedBody;
+
+    const updatePayload = {
+      updated_at: new Date().toISOString()
+    };
+
+    if (hotelSlug !== undefined) updatePayload.hotel_slug = hotelSlug;
+    if (imageUrl !== undefined) updatePayload.image_url = imageUrl;
+    if (storagePath !== undefined) updatePayload.storage_path = storagePath || null;
+    if (alt !== undefined) updatePayload.alt = alt || "";
+    if (layoutVariant !== undefined) updatePayload.layout_variant = layoutVariant;
+    if (isActive !== undefined) updatePayload.is_active = !!isActive;
+    if (sortOrder !== undefined) updatePayload.sort_order = Number(sortOrder);
+
+    if (Object.keys(updatePayload).length === 1) {
+      return res.status(400).json({
+        success: false,
+        message: "At least one field is required to update a gallery item"
+      });
+    }
+
+    const { data, error } = await supabase
+      .from("gallery_items")
+      .update(updatePayload)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      message: "Gallery item updated successfully",
+      galleryItem: data
+    });
+  } catch (error) {
+    console.error("Gallery item update error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update gallery item"
+    });
+  }
+});
+
 router.patch("/menu-items/:id/archive", async (req, res) => {
   try {
     const { id } = req.params;
@@ -651,6 +1371,38 @@ router.patch("/menu-items/:id/archive", async (req, res) => {
   }
 });
 
+router.patch("/gallery-items/:id/archive", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { isArchived } = req.body;
+
+    const { data, error } = await supabase
+      .from("gallery_items")
+      .update({
+        is_archived: !!isArchived,
+        is_active: !!isArchived ? false : true,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      message: isArchived ? "Gallery item archived" : "Gallery item restored",
+      galleryItem: data
+    });
+  } catch (error) {
+    console.error("Gallery item archive error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to archive gallery item"
+    });
+  }
+});
+
 router.delete("/menu-items/:id", async (req, res) => {
   try {
     const { id } = req.params;
@@ -671,6 +1423,61 @@ router.delete("/menu-items/:id", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to delete menu item"
+    });
+  }
+});
+
+router.patch("/gallery-items/:id/active", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { isActive } = req.body;
+
+    const { data, error } = await supabase
+      .from("gallery_items")
+      .update({
+        is_active: !!isActive,
+        updated_at: new Date().toISOString()
+      })
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      message: isActive ? "Gallery item activated" : "Gallery item deactivated",
+      galleryItem: data
+    });
+  } catch (error) {
+    console.error("Gallery item active toggle error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update gallery item active state"
+    });
+  }
+});
+
+router.delete("/gallery-items/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { error } = await supabase
+      .from("gallery_items")
+      .delete()
+      .eq("id", id);
+
+    if (error) throw error;
+
+    res.json({
+      success: true,
+      message: "Gallery item deleted successfully"
+    });
+  } catch (error) {
+    console.error("Gallery item delete error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to delete gallery item"
     });
   }
 });

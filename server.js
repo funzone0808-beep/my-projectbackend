@@ -9,6 +9,7 @@ const logger = require("./utils/logger");
 const ordersRoute = require("./routes/orders");
 const inquiriesRoute = require("./routes/inquiries");
 const reservationsRoute = require("./routes/reservations");
+const testimonialsRoute = require("./routes/testimonials");
 const adminRoute = require("./routes/admin");
 const tenantRoute = require("./routes/tenant");
 const publicRoute = require("./routes/public");
@@ -100,6 +101,7 @@ app.get("/api/health", (req, res) => {
 app.use("/api/orders", ordersRoute);
 app.use("/api/inquiries", inquiriesRoute);
 app.use("/api/reservations", reservationsRoute);
+app.use("/api/testimonials", testimonialsRoute);
 app.use("/api/admin", adminRoute);
 app.use("/api/tenant", tenantRoute);
 app.use("/api/public", publicRoute);
@@ -112,11 +114,6 @@ logger.error("Unhandled server error", {
   message: err.message,
   stack: env.isDevelopment ? err.stack : undefined
 });
-
-app.get("/", (req, res) => {
-  res.send("Backend is running ");
-});
-
 
   if (err.message === "Not allowed by CORS") {
     return res.status(403).json({
