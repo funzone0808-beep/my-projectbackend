@@ -100,8 +100,32 @@ function getOrderContextColumns(orderContext) {
   };
 }
 
-function shouldRetryWithoutOrderContextColumns(error, orderContextColumns) {
-  if (!Object.keys(orderContextColumns).length || !error) return false;
+function hasDineInTableContext(orderContext) {
+  return orderContext?.orderType === "dine-in" && !!orderContext.tableNumber;
+}
+
+function getBillingMetadataColumns({ orderContext, paymentMethod, paymentConfirmed }) {
+  if (!hasDineInTableContext(orderContext)) {
+    return {};
+  }
+
+  const normalizedPaymentMethod = normalizeOptionalText(paymentMethod, 60).toLowerCase();
+  const isUpiPayment =
+    normalizedPaymentMethod.includes("upi") ||
+    normalizedPaymentMethod.includes("gpay") ||
+    normalizedPaymentMethod.includes("google pay");
+
+  return {
+    payment_status: isUpiPayment && paymentConfirmed
+      ? "customer_confirmed"
+      : "unpaid",
+    billing_status: "not_billed"
+  };
+}
+
+function shouldRetryWithoutOptionalOrderColumns(error, optionalOrderColumns) {
+  const optionalColumnNames = Object.keys(optionalOrderColumns);
+  if (!optionalColumnNames.length || !error) return false;
 
   const message = [
     error.code,
@@ -117,19 +141,15 @@ function shouldRetryWithoutOrderContextColumns(error, orderContextColumns) {
     message.includes("pgrst204") ||
     (
       message.includes("could not find") &&
-      (
-        message.includes("order_type") ||
-        message.includes("table_number") ||
-        message.includes("order_source")
-      )
+      optionalColumnNames.some((columnName) => message.includes(columnName.toLowerCase()))
     )
   );
 }
 
-async function insertOrderRow(baseOrderRow, orderContextColumns) {
-  const hasOrderContextColumns = Object.keys(orderContextColumns).length > 0;
-  const firstAttemptRow = hasOrderContextColumns
-    ? { ...baseOrderRow, ...orderContextColumns }
+async function insertOrderRow(baseOrderRow, optionalOrderColumns = {}) {
+  const hasOptionalOrderColumns = Object.keys(optionalOrderColumns).length > 0;
+  const firstAttemptRow = hasOptionalOrderColumns
+    ? { ...baseOrderRow, ...optionalOrderColumns }
     : baseOrderRow;
 
   const firstAttempt = await supabase
@@ -138,16 +158,16 @@ async function insertOrderRow(baseOrderRow, orderContextColumns) {
     .select()
     .single();
 
-  if (!firstAttempt.error || !hasOrderContextColumns) {
+  if (!firstAttempt.error || !hasOptionalOrderColumns) {
     return firstAttempt;
   }
 
-  if (!shouldRetryWithoutOrderContextColumns(firstAttempt.error, orderContextColumns)) {
+  if (!shouldRetryWithoutOptionalOrderColumns(firstAttempt.error, optionalOrderColumns)) {
     return firstAttempt;
   }
 
   console.warn(
-    "Order context columns are not available yet. Retrying order save without structured table columns."
+    "Optional order columns are not available yet. Retrying order save without structured order metadata columns."
   );
 
   return supabase
@@ -168,6 +188,7 @@ router.post("/", validateBody(orderSchema), async (req, res) => {
       customerPhone,
       customerAddress,
       paymentMethod,
+      paymentConfirmed,
       note,
       items,
       totals,
@@ -193,7 +214,16 @@ router.post("/", validateBody(orderSchema), async (req, res) => {
     };
     const safeOrderContext = getNormalizedOrderContext(orderContext);
     const orderContextColumns = getOrderContextColumns(safeOrderContext);
-    const { data, error } = await insertOrderRow(baseOrderRow, orderContextColumns);
+    const billingMetadataColumns = getBillingMetadataColumns({
+      orderContext: safeOrderContext,
+      paymentMethod,
+      paymentConfirmed
+    });
+    const optionalOrderColumns = {
+      ...orderContextColumns,
+      ...billingMetadataColumns
+    };
+    const { data, error } = await insertOrderRow(baseOrderRow, optionalOrderColumns);
 
     if (error) throw error;
 
@@ -208,6 +238,8 @@ router.post("/", validateBody(orderSchema), async (req, res) => {
         customerPhone: data.customer_phone || customerPhone,
         customerAddress: data.customer_address || customerAddress || "",
         paymentMethod: data.payment_method || paymentMethod || "COD",
+        paymentStatus: data.payment_status || billingMetadataColumns.payment_status || null,
+        billingStatus: data.billing_status || billingMetadataColumns.billing_status || null,
         note: data.note || note || "",
         items: Array.isArray(data.items) ? data.items : items || [],
         totals:

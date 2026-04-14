@@ -14,6 +14,7 @@ const adminRoute = require("./routes/admin");
 const tenantRoute = require("./routes/tenant");
 const publicRoute = require("./routes/public");
 const authRoute = require("./routes/auth");
+const staffRoute = require("./routes/staff");
 const uploadRoute = require("./routes/upload");
 
 const app = express();
@@ -118,6 +119,7 @@ app.use("/api/admin", adminRoute);
 app.use("/api/tenant", tenantRoute);
 app.use("/api/public", publicRoute);
 app.use("/api/auth", authRoute);
+app.use("/api/staff", authLimiter, staffRoute);
 app.use("/api/admin/upload", uploadRoute);
 
 app.use((err, req, res, next) => {

@@ -20,6 +20,8 @@ const {
 const NOTIFICATION_EVENT_SOURCE_TYPES = ["order", "reservation", "inquiry"];
 const NOTIFICATION_EVENT_STATUSES = ["pending", "sent", "failed", "skipped"];
 const NOTIFICATION_EVENT_MAX_RETRIES = 3;
+const ORDER_BILLING_STATUSES = ["not_billed", "billed", "cancelled"];
+const ORDER_PAYMENT_STATUSES = ["unpaid", "customer_confirmed", "paid", "refunded"];
 
 function isMissingTestimonialsRelationError(error) {
   const code = String(error?.code || "").trim().toUpperCase();
@@ -45,6 +47,114 @@ function getNotificationEventsLimit(value) {
   }
 
   return Math.min(parsedValue, 200);
+}
+
+function normalizeStatusValue(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function normalizeBillNumberPart(value, fallback = "ORDER", maxLength = 18) {
+  const normalizedValue = String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+  return (normalizedValue || fallback).slice(0, maxLength);
+}
+
+function buildOrderBillNumber(order = {}, billedAt = new Date().toISOString()) {
+  const hotelPart = normalizeBillNumberPart(
+    order.hotel_slug || order.hotel_name,
+    "HOTEL",
+    18
+  );
+  const datePart = String(billedAt || new Date().toISOString())
+    .slice(0, 10)
+    .replace(/[^0-9]/g, "");
+  const orderIdPart = String(order.id || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "")
+    .slice(-8);
+
+  return [
+    "BILL",
+    hotelPart,
+    datePart || "DATE",
+    orderIdPart || "ORDER"
+  ].join("-");
+}
+
+function buildOrderBillingUpdatePayload(body = {}) {
+  const updatePayload = {};
+  const updatedAt = new Date().toISOString();
+
+  if (body.billingStatus !== undefined) {
+    const billingStatus = normalizeStatusValue(body.billingStatus);
+
+    if (!ORDER_BILLING_STATUSES.includes(billingStatus)) {
+      return {
+        error: `Billing status must be one of: ${ORDER_BILLING_STATUSES.join(", ")}`
+      };
+    }
+
+    updatePayload.billing_status = billingStatus;
+
+    if (billingStatus === "billed") {
+      updatePayload.billed_at = updatedAt;
+    } else if (billingStatus === "not_billed") {
+      updatePayload.billed_at = null;
+    }
+  }
+
+  if (body.paymentStatus !== undefined) {
+    const paymentStatus = normalizeStatusValue(body.paymentStatus);
+
+    if (!ORDER_PAYMENT_STATUSES.includes(paymentStatus)) {
+      return {
+        error: `Payment status must be one of: ${ORDER_PAYMENT_STATUSES.join(", ")}`
+      };
+    }
+
+    updatePayload.payment_status = paymentStatus;
+
+    if (paymentStatus === "paid") {
+      updatePayload.paid_at = updatedAt;
+    } else if (paymentStatus === "unpaid") {
+      updatePayload.paid_at = null;
+    }
+  }
+
+  if (!Object.keys(updatePayload).length) {
+    return {
+      error: "Billing status or payment status is required"
+    };
+  }
+
+  return { updatePayload };
+}
+
+function isMissingOrderBillingColumnsError(error) {
+  const code = String(error?.code || "").trim().toUpperCase();
+  const details = `${error?.message || ""} ${error?.details || ""} ${error?.hint || ""}`
+    .trim()
+    .toLowerCase();
+  const billingColumns = [
+    "payment_status",
+    "billing_status",
+    "bill_number",
+    "billed_at",
+    "paid_at"
+  ];
+
+  return (
+    code === "PGRST204" ||
+    (
+      details.includes("could not find") &&
+      billingColumns.some((columnName) => details.includes(columnName))
+    )
+  );
 }
 
 function buildNotificationSettingsResponse(settingsRow, hotelSlug = "") {
@@ -422,6 +532,83 @@ router.patch("/orders/:id/status", async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Failed to update order status"
+    });
+  }
+});
+
+router.patch("/orders/:id/billing", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { updatePayload, error: validationError } = buildOrderBillingUpdatePayload(req.body);
+
+    if (validationError) {
+      return res.status(400).json({
+        success: false,
+        message: validationError
+      });
+    }
+
+    if (updatePayload.billing_status === "billed") {
+      const { data: currentOrder, error: currentOrderError } = await supabase
+        .from("orders")
+        .select("id,hotel_slug,hotel_name,bill_number")
+        .eq("id", id)
+        .maybeSingle();
+
+      if (currentOrderError) {
+        if (isMissingOrderBillingColumnsError(currentOrderError)) {
+          return res.status(400).json({
+            success: false,
+            message: "Order billing fields are not initialized yet"
+          });
+        }
+
+        throw currentOrderError;
+      }
+
+      if (!currentOrder) {
+        return res.status(404).json({
+          success: false,
+          message: "Order not found"
+        });
+      }
+
+      if (!currentOrder.bill_number) {
+        updatePayload.bill_number = buildOrderBillNumber(
+          currentOrder,
+          updatePayload.billed_at
+        );
+      }
+    }
+
+    const { data, error } = await supabase
+      .from("orders")
+      .update(updatePayload)
+      .eq("id", id)
+      .select()
+      .single();
+
+    if (error) {
+      if (isMissingOrderBillingColumnsError(error)) {
+        return res.status(400).json({
+          success: false,
+          message: "Order billing fields are not initialized yet"
+        });
+      }
+
+      throw error;
+    }
+
+    res.json({
+      success: true,
+      message: "Order billing updated",
+      order: data
+    });
+  } catch (error) {
+    console.error("Order billing update error:", error);
+    res.status(500).json({
+      success: false,
+      message: "Failed to update order billing"
     });
   }
 });
